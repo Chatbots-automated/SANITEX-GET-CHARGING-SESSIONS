@@ -46,6 +46,7 @@ module.exports = async (req, res) => {
   const qs = new URLSearchParams();
   qs.set('per_page', String(Math.min(Number(per_page) || 100, 100)));
   qs.set('cursor', ''); // engage cursor pagination
+  qs.set('withAuthorization', 'true'); // include authorization to resolve userId/idTag
 
   if (startedAfter)  qs.set('filter[startedAfter]', startedAfter);
   if (startedBefore) qs.set('filter[startedBefore]', startedBefore);
@@ -72,11 +73,29 @@ module.exports = async (req, res) => {
 
       const page = await resp.json();
       const data = Array.isArray(page?.data) ? page.data : [];
+
       for (const s of data) {
-        const id = String(s.id ?? `${Date.now()}-${Math.random()}`);
-        if (seen.has(id)) continue;
-        seen.add(id);
-        out.push(s);
+        const uniqueId = String(s.id ?? `${Date.now()}-${Math.random()}`);
+        if (seen.has(uniqueId)) continue;
+        seen.add(uniqueId);
+
+        // ----- normalize userId -----
+        const topUser = Number(s.userId);
+        const authUser = Number(s.authorization?.userId);
+        const resolvedUserId = Number.isFinite(topUser) && topUser > 0
+          ? topUser
+          : (Number.isFinite(authUser) && authUser > 0 ? authUser : 0);
+
+        // ----- normalize idTag (optional) -----
+        const resolvedIdTag = s.idTag ?? s.authorization?.rfidTagUid ?? null;
+
+        out.push({
+          ...s,
+          userIdRaw: s.userId ?? null,
+          userId: resolvedUserId,        // overwrite with resolved id
+          idTagRaw: s.idTag ?? null,
+          idTag: resolvedIdTag,          // ensure we have an idTag if possible
+        });
       }
 
       next = page?.links?.next || null;
