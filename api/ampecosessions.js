@@ -1,9 +1,5 @@
 // /api/ampecosessions.js
-// Sessions (partner-scoped) + CP/Location enrichment + Holder name via Users/Read,
-// fallback via Id Tags / Listing (by UID).
-// Env:
-//   AMPECO_BASE_URL      e.g. https://cp.ikrautas.lt
-//   AMPECO_PARTNER_TOKEN e.g. "Bearer 8fb5...aab6" (prefix is auto-added if missing)
+// Sessions + CP/Location + Holder name + EVSE details (type/connector/max power)
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
@@ -43,8 +39,9 @@ module.exports = async (req, res) => {
   /* ========== 1) Sessions (cursor pagination) ========== */
   const sQS = new URLSearchParams();
   sQS.set('per_page', String(Math.min(Number(per_page) || 100, 100)));
-  sQS.set('cursor', '');                       // engage cursor
-  sQS.set('withAuthorization', 'true');        // to resolve userId/idTag when top-level is 0
+  sQS.set('cursor', '');
+  sQS.set('withAuthorization', 'true');
+
   if (startedAfter)  sQS.set('filter[startedAfter]', startedAfter);
   if (startedBefore) sQS.set('filter[startedBefore]', startedBefore);
   if (endedAfter)    sQS.set('filter[endedAfter]', endedAfter);
@@ -98,9 +95,9 @@ module.exports = async (req, res) => {
     return res.status(200).json({ count: 0, data: [] });
   }
 
-  /* ========== 2) Charge Points listing to map locationId ========== */
+  /* ========== 2) Charge Points listing → map locationId ========== */
   const wantedCpIds = new Set(
-    sessions.map(s => s.chargePointId).filter(id => id !== null && id !== undefined)
+    sessions.map(s => s.chargePointId).filter(id => id != null)
   );
   const cpMap = new Map();
   const missingCp = new Set(wantedCpIds);
@@ -127,11 +124,11 @@ module.exports = async (req, res) => {
     cpPages++;
   }
 
-  /* ========== 3) Locations listing to resolve site address/geo ========== */
+  /* ========== 3) Locations listing → address/geo ========== */
   const wantedLocIds = new Set(
     Array.from(cpMap.values())
       .map(cp => cp?.locationId)
-      .filter(id => id !== null && id !== undefined)
+      .filter(id => id != null)
   );
 
   const locMap = new Map();
@@ -182,17 +179,13 @@ module.exports = async (req, res) => {
     return { locationName: name, addressLine1: line1, city, country, latitude, longitude };
   };
 
-  /* ========== 4) Holder name enrichment ========== */
-  // First pass: collect userIds>0 and idTags without a label.
+  /* ========== 4) Holder name ========== */
   const userIds = new Set(sessions.map(s => s.userId).filter(n => Number.isFinite(n) && n > 0));
   const idTagsNeedingLookup = new Set(
-    sessions
-      .filter(s => (!s.idTagLabel || String(s.idTagLabel).trim() === '') && s.idTag)
-      .map(s => s.idTag)
+    sessions.filter(s => (!s.idTagLabel || String(s.idTagLabel).trim() === '') && s.idTag).map(s => s.idTag)
   );
 
-  // 4a) Fetch Users / Read individually (safe & reliable)
-  const userMap = new Map(); // userId -> { firstName, lastName, email, name }
+  const userMap = new Map(); // userId -> { name, firstName, lastName, email }
   const USER_CONCURRENCY = 8;
   const userArray = Array.from(userIds);
 
@@ -210,13 +203,12 @@ module.exports = async (req, res) => {
         const email = u?.email ?? null;
         const name  = u?.name ?? ([first, last].filter(Boolean).join(' ') || null);
         userMap.set(uid, { firstName: first, lastName: last, email, name });
-      } catch { /* ignore per-user errors */ }
+      } catch {}
     }));
   }
 
-  // 4b) Fallback: Id Tags / Listing by UID to discover userId, then fetch that user
-  // (Some partner-scoped tokens may not allow this; we ignore failures.)
-  const tagToUserId = new Map(); // uid -> userId
+  // Fallback via id-tags -> userId -> user
+  const tagToUserId = new Map();
   const TAG_CONCURRENCY = 8;
   const tagArray = Array.from(idTagsNeedingLookup);
 
@@ -224,7 +216,6 @@ module.exports = async (req, res) => {
     const chunk = tagArray.slice(i, i + TAG_CONCURRENCY);
     await Promise.all(chunk.map(async (uid) => {
       const qs = new URLSearchParams();
-      // Docs show Id Tags v2.0; filtering key commonly 'uid'
       qs.set('filter[uid]', uid);
       qs.set('per_page', '1');
       const url = `${BASE}/public-api/resources/id-tags/v2.0?${qs.toString()}`;
@@ -235,11 +226,10 @@ module.exports = async (req, res) => {
         const row = Array.isArray(payload?.data) ? payload.data[0] : null;
         const uId = row?.userId ?? row?.user?.id ?? null;
         if (uId != null) tagToUserId.set(uid, uId);
-      } catch { /* ignore */ }
+      } catch {}
     }));
   }
 
-  // Fetch any users discovered from id-tags that we still don't have
   const extraUserIds = Array.from(tagToUserId.values()).filter(uId => !userMap.has(uId));
   for (let i = 0; i < extraUserIds.length; i += USER_CONCURRENCY) {
     const chunk = extraUserIds.slice(i, i + USER_CONCURRENCY);
@@ -255,18 +245,82 @@ module.exports = async (req, res) => {
         const email = u?.email ?? null;
         const name  = u?.name ?? ([first, last].filter(Boolean).join(' ') || null);
         userMap.set(uid, { firstName: first, lastName: last, email, name });
-      } catch { /* ignore */ }
+      } catch {}
     }));
   }
 
-  /* ========== 5) Final enrichment & response ========== */
+  /* ========== 5) EVSE listing → type/connector/max power ========== */
+  const wantedEvseIds = new Set(
+    sessions.map(s => s.evseId).filter(id => id != null)
+  );
+
+  const evseMap = new Map(); // evseId -> evse object
+  const missingEvse = new Set(wantedEvseIds);
+  let evseNext = `${BASE}/public-api/resources/evses/v1.0?per_page=100&cursor=`;
+  let evsePages = 0;
+
+  while (evseNext && evsePages < maxPages && missingEvse.size > 0) {
+    const r = await fetch(evseNext, { headers });
+    if (!r.ok) {
+      const text = await r.text().catch(() => '');
+      return res.status(r.status).json({ stage: 'evses', upstreamStatus: r.status, url: evseNext, body: text });
+    }
+    const page = await r.json();
+    const evses = Array.isArray(page?.data) ? page.data : [];
+    for (const evse of evses) {
+      const id = evse?.id ?? evse?.evseId ?? null;
+      if (id == null) continue;
+      if (missingEvse.has(id)) {
+        evseMap.set(id, evse);
+        missingEvse.delete(id);
+      }
+    }
+    evseNext = page?.links?.next || null;
+    evsePages++;
+  }
+
+  // Extract EVSE fields with fallbacks (schema differences across tenants)
+  const extractEvseFields = (evse) => {
+    if (!evse || typeof evse !== 'object') {
+      return { evseType: null, connectorStandards: null, maxPowerKw: null };
+    }
+    // Type (common patterns: 'ac'/'dc', 'currentType', 'powerType', etc.)
+    const evseType =
+      evse.type ??
+      evse.evseType ??
+      evse.currentType ??
+      evse.powerType ??
+      evse.dcAc ??
+      null;
+
+    // Connector standards (array) – look across representations
+    const connectors = evse.connectors || evse.connectorList || [];
+    const connStandards = Array.from(new Set(
+      connectors.map(c =>
+        c?.standard || c?.type || c?.connectorType || c?.format || null
+      ).filter(Boolean)
+    ));
+    const connectorStandards = connStandards.length ? connStandards : null;
+
+    // Max power (prefer kW, else convert from W)
+    let maxPowerKw = null;
+    const pKw = evse.maxPowerKw ?? evse.powerKw ?? evse.power ?? null;
+    const pW  = evse.maxPowerW  ?? evse.powerW  ?? null;
+    if (Number.isFinite(Number(pKw))) maxPowerKw = Number(pKw);
+    else if (Number.isFinite(Number(pW))) maxPowerKw = Number(pW) / 1000;
+
+    return { evseType, connectorStandards, maxPowerKw: maxPowerKw ?? null };
+  };
+
+  /* ========== 6) Final enrichment & response ========== */
   const enriched = sessions.map((s) => {
+    // CP/location
     const cp = cpMap.get(s.chargePointId);
     const { chargePointName, locationId } = extractCpFields(cp);
     const loc = locMap.get(locationId);
     const locFields = extractLocationFields(loc);
 
-    // Holder name: prefer idTagLabel; else userMap; else email; else null
+    // Holder
     const userInfo =
       (s.userId && userMap.get(s.userId)) ||
       (s.idTag && tagToUserId.has(s.idTag) && userMap.get(tagToUserId.get(s.idTag))) ||
@@ -279,12 +333,19 @@ module.exports = async (req, res) => {
       (userInfo?.email) ||
       null;
 
+    // EVSE
+    const evse = evseMap.get(s.evseId);
+    const { evseType, connectorStandards, maxPowerKw } = extractEvseFields(evse);
+
     return {
       ...s,
       chargePointName: chargePointName ?? null,
       locationId: locationId ?? null,
       holderName,
       holderEmail: userInfo?.email ?? null,
+      evseType,
+      connectorStandards,
+      maxPowerKw,
       ...locFields,
     };
   });
