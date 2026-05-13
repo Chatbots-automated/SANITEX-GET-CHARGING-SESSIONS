@@ -15,7 +15,8 @@ module.exports = async (req, res) => {
   try {
     if (req.body && typeof req.body === 'object') body = req.body;
     else {
-      let raw = ''; for await (const c of req) raw += c;
+      let raw = '';
+      for await (const c of req) raw += c;
       body = raw ? JSON.parse(raw) : {};
     }
   } catch {
@@ -23,8 +24,13 @@ module.exports = async (req, res) => {
   }
 
   const {
-    startedAfter, startedBefore, endedAfter, endedBefore,
-    tariffSnapshotId, per_page = 100, maxPages = 10000,
+    startedAfter,
+    startedBefore,
+    endedAfter,
+    endedBefore,
+    tariffSnapshotId,
+    per_page = 100,
+    maxPages = 10000,
   } = body;
 
   /* ========== 1) Sessions ========== */
@@ -32,44 +38,79 @@ module.exports = async (req, res) => {
   sQS.set('per_page', String(Math.min(Number(per_page) || 100, 100)));
   sQS.set('cursor', '');
   sQS.set('withAuthorization', 'true');
-  if (startedAfter)  sQS.set('filter[startedAfter]', startedAfter);
+
+  if (startedAfter) sQS.set('filter[startedAfter]', startedAfter);
   if (startedBefore) sQS.set('filter[startedBefore]', startedBefore);
-  if (endedAfter)    sQS.set('filter[endedAfter]', endedAfter);
-  if (endedBefore)   sQS.set('filter[endedBefore]', endedBefore);
+  if (endedAfter) sQS.set('filter[endedAfter]', endedAfter);
+  if (endedBefore) sQS.set('filter[endedBefore]', endedBefore);
   if (tariffSnapshotId != null) sQS.set('filter[tariffSnapshotId]', String(tariffSnapshotId));
 
   let next = `${BASE}/public-api/resources/sessions/v1.0?${sQS.toString()}`;
-  const sessions = []; const seen = new Set(); let pages = 0;
+  const sessions = [];
+  const seen = new Set();
+  let pages = 0;
 
   while (next && pages < maxPages) {
     const r = await fetch(next, { headers });
+
     if (!r.ok) {
       const text = await r.text().catch(() => '');
-      return res.status(r.status).json({ stage: 'sessions', upstreamStatus: r.status, url: next, body: text });
+      return res.status(r.status).json({
+        stage: 'sessions',
+        upstreamStatus: r.status,
+        url: next,
+        body: text,
+      });
     }
+
     const page = await r.json();
     const data = Array.isArray(page?.data) ? page.data : [];
+
     for (const s of data) {
       const sid = String(s.id ?? `${Date.now()}-${Math.random()}`);
-      if (seen.has(sid)) continue; seen.add(sid);
+      if (seen.has(sid)) continue;
+      seen.add(sid);
+
       const topUser = Number(s.userId);
       const authUser = Number(s.authorization?.userId);
+
       const resolvedUserId =
-        (Number.isFinite(topUser) && topUser > 0) ? topUser :
-        (Number.isFinite(authUser) && authUser > 0 ? authUser : 0);
+        Number.isFinite(topUser) && topUser > 0
+          ? topUser
+          : Number.isFinite(authUser) && authUser > 0
+            ? authUser
+            : 0;
+
       const resolvedIdTag = s.idTag ?? s.authorization?.rfidTagUid ?? null;
-      const wh = (s.energy ?? s.energyConsumption?.total ?? 0);
+
+      const wh = s.energy ?? s.energyConsumption?.total ?? 0;
       const kWh = Number((wh / 1000).toFixed(3));
-      sessions.push({ ...s, userIdRaw: s.userId ?? null, userId: resolvedUserId, idTagRaw: s.idTag ?? null, idTag: resolvedIdTag, kWh });
+
+      sessions.push({
+        ...s,
+        userIdRaw: s.userId ?? null,
+        userId: resolvedUserId,
+        idTagRaw: s.idTag ?? null,
+        idTag: resolvedIdTag,
+        kWh,
+      });
     }
+
     next = page?.links?.next || null;
     pages++;
   }
-  if (!sessions.length) return res.status(200).json({ count: 0, data: [] });
+
+  if (!sessions.length) {
+    return res.status(200).json({ count: 0, data: [] });
+  }
 
   /* ========== 2) Charge Points listing (grab locationId + embedded evses if present) ========== */
-  const wantedCpIds = new Set(sessions.map(s => s.chargePointId).filter(v => v != null));
-  const cpMap = new Map(); const missingCp = new Set(wantedCpIds);
+  const wantedCpIds = new Set(
+    sessions.map(s => s.chargePointId).filter(v => v != null)
+  );
+
+  const cpMap = new Map();
+  const missingCp = new Set(wantedCpIds);
   let cpNext = `${BASE}/public-api/resources/charge-points/v1.0?per_page=100&cursor=`;
   pages = 0;
 
@@ -78,51 +119,82 @@ module.exports = async (req, res) => {
 
   while (cpNext && pages < maxPages && missingCp.size > 0) {
     const r = await fetch(cpNext, { headers });
+
     if (!r.ok) {
       const text = await r.text().catch(() => '');
-      return res.status(r.status).json({ stage: 'charge-points', upstreamStatus: r.status, url: cpNext, body: text });
+      return res.status(r.status).json({
+        stage: 'charge-points',
+        upstreamStatus: r.status,
+        url: cpNext,
+        body: text,
+      });
     }
+
     const page = await r.json();
     const cps = Array.isArray(page?.data) ? page.data : [];
+
     for (const cp of cps) {
       const id = cp?.id ?? cp?.chargePointId ?? null;
       if (id == null) continue;
+
       if (missingCp.has(id)) {
         cpMap.set(id, cp);
+
         // If CP includes `evses`, index them by id to avoid extra calls.
         const list = Array.isArray(cp?.evses) ? cp.evses : [];
         for (const evse of list) {
           const evseId = evse?.id ?? evse?.evseId ?? null;
-          if (evseId != null && !evseMap.has(evseId)) evseMap.set(evseId, evse);
+          if (evseId != null && !evseMap.has(evseId)) {
+            evseMap.set(evseId, evse);
+          }
         }
+
         missingCp.delete(id);
       }
     }
+
     cpNext = page?.links?.next || null;
     pages++;
   }
 
   /* ========== 3) Locations listing (address/geo) ========== */
   const wantedLocIds = new Set(
-    Array.from(cpMap.values()).map(cp => cp?.locationId).filter(v => v != null)
+    Array.from(cpMap.values())
+      .map(cp => cp?.locationId)
+      .filter(v => v != null)
   );
-  const locMap = new Map(); const missingLocs = new Set(wantedLocIds);
+
+  const locMap = new Map();
+  const missingLocs = new Set(wantedLocIds);
   let locNext = `${BASE}/public-api/resources/locations/v1.0?per_page=100&cursor=`;
   pages = 0;
 
   while (locNext && pages < maxPages && missingLocs.size > 0) {
     const r = await fetch(locNext, { headers });
+
     if (!r.ok) {
       const text = await r.text().catch(() => '');
-      return res.status(r.status).json({ stage: 'locations', upstreamStatus: r.status, url: locNext, body: text });
+      return res.status(r.status).json({
+        stage: 'locations',
+        upstreamStatus: r.status,
+        url: locNext,
+        body: text,
+      });
     }
+
     const page = await r.json();
     const locs = Array.isArray(page?.data) ? page.data : [];
+
     for (const loc of locs) {
       const id = loc?.id;
       if (id == null) continue;
-      if (missingLocs.has(id)) { locMap.set(id, loc); missingLocs.delete(id); }
+
+      if (missingLocs.has(id)) {
+        locMap.set(id, loc);
+        missingLocs.delete(id);
+      }
     }
+
     locNext = page?.links?.next || null;
     pages++;
   }
@@ -132,38 +204,140 @@ module.exports = async (req, res) => {
     locationId: cp?.locationId ?? null,
   });
 
+  // Stronger city/location extractor
   const extractLocationFields = (loc) => {
-    const name = loc?.name ?? loc?.title ?? null;
-    const address = loc?.address ?? loc?.siteAddress ?? loc?.location?.address ?? null;
-    const line1 = address?.line1 ?? address?.addressLine1 ?? address?.street ?? address?.line ?? null;
-    const city = address?.city ?? address?.town ?? address?.locality ?? null;
-    const country = address?.country ?? address?.countryCode ?? null;
-    const geo = loc?.geoposition ?? loc?.geo ?? loc?.location?.geoposition ?? {};
-    const latitude = geo?.latitude ?? geo?.lat ?? null;
-    const longitude = geo?.longitude ?? geo?.lng ?? null;
-    return { locationName: name, addressLine1: line1, city, country, latitude, longitude };
+    if (!loc || typeof loc !== 'object') {
+      return {
+        locationName: null,
+        addressLine1: null,
+        city: null,
+        country: null,
+        latitude: null,
+        longitude: null,
+        rawLocationAddress: null,
+      };
+    }
+
+    const address =
+      loc.address ??
+      loc.siteAddress ??
+      loc.location?.address ??
+      loc.addressObject ??
+      loc.addressData ??
+      null;
+
+    const name =
+      loc.name ??
+      loc.title ??
+      loc.label ??
+      loc.displayName ??
+      null;
+
+    const line1 =
+      address?.line1 ??
+      address?.addressLine1 ??
+      address?.street ??
+      address?.line ??
+      address?.streetAddress ??
+      address?.formatted ??
+      loc.addressLine1 ??
+      loc.street ??
+      loc.streetAddress ??
+      loc.formattedAddress ??
+      null;
+
+    const city =
+      address?.city ??
+      address?.town ??
+      address?.locality ??
+      address?.municipality ??
+      address?.region ??
+      address?.cityName ??
+      address?.administrativeArea ??
+      loc.city ??
+      loc.town ??
+      loc.locality ??
+      loc.municipality ??
+      loc.region ??
+      loc.cityName ??
+      loc.administrativeArea ??
+      null;
+
+    const country =
+      address?.country ??
+      address?.countryCode ??
+      loc.country ??
+      loc.countryCode ??
+      null;
+
+    const geo =
+      loc.geoposition ??
+      loc.geo ??
+      loc.coordinates ??
+      loc.location?.geoposition ??
+      loc.location?.geo ??
+      {};
+
+    const latitude =
+      geo?.latitude ??
+      geo?.lat ??
+      loc.latitude ??
+      loc.lat ??
+      null;
+
+    const longitude =
+      geo?.longitude ??
+      geo?.lng ??
+      geo?.lon ??
+      loc.longitude ??
+      loc.lng ??
+      loc.lon ??
+      null;
+
+    return {
+      locationName: name,
+      addressLine1: line1,
+      city,
+      country,
+      latitude,
+      longitude,
+
+      // temporary debug so we can see where city actually lives if still empty
+      rawLocationAddress: address,
+    };
   };
 
   /* ========== 4) Holder name (users + id-tags fallback) ========== */
-  const userIds = new Set(sessions.map(s => s.userId).filter(n => Number.isFinite(n) && n > 0));
+  const userIds = new Set(
+    sessions.map(s => s.userId).filter(n => Number.isFinite(n) && n > 0)
+  );
+
   const idTagsNeedingLookup = new Set(
-    sessions.filter(s => (!s.idTagLabel || String(s.idTagLabel).trim() === '') && s.idTag).map(s => s.idTag)
+    sessions
+      .filter(s => (!s.idTagLabel || String(s.idTagLabel).trim() === '') && s.idTag)
+      .map(s => s.idTag)
   );
 
   const userMap = new Map();
   const USER_CONCURRENCY = 8;
+
   const fetchUser = async (uid) => {
     try {
       const r = await fetch(`${BASE}/public-api/resources/users/v1.0/${uid}`, { headers });
       if (!r.ok) return;
-      const payload = await r.json(); const u = payload?.data ?? payload;
+
+      const payload = await r.json();
+      const u = payload?.data ?? payload;
+
       const first = u?.firstName ?? u?.firstname ?? null;
-      const last  = u?.lastName  ?? u?.lastname  ?? null;
+      const last = u?.lastName ?? u?.lastname ?? null;
       const email = u?.email ?? null;
-      const name  = u?.name ?? ([first, last].filter(Boolean).join(' ') || null);
+      const name = u?.name ?? ([first, last].filter(Boolean).join(' ') || null);
+
       userMap.set(uid, { firstName: first, lastName: last, email, name });
     } catch {}
   };
+
   const arrU = Array.from(userIds);
   for (let i = 0; i < arrU.length; i += USER_CONCURRENCY) {
     await Promise.all(arrU.slice(i, i + USER_CONCURRENCY).map(fetchUser));
@@ -172,19 +346,28 @@ module.exports = async (req, res) => {
   // id-tags -> userId -> user
   const tagToUserId = new Map();
   const arrTags = Array.from(idTagsNeedingLookup);
+
   for (let i = 0; i < arrTags.length; i += 8) {
-    await Promise.all(arrTags.slice(i, i + 8).map(async (uid) => {
-      const qs = new URLSearchParams(); qs.set('filter[uid]', uid); qs.set('per_page', '1');
-      try {
-        const r = await fetch(`${BASE}/public-api/resources/id-tags/v2.0?${qs.toString()}`, { headers });
-        if (!r.ok) return;
-        const payload = await r.json();
-        const row = Array.isArray(payload?.data) ? payload.data[0] : null;
-        const uId = row?.userId ?? row?.user?.id ?? null;
-        if (uId != null) tagToUserId.set(uid, uId);
-      } catch {}
-    }));
+    await Promise.all(
+      arrTags.slice(i, i + 8).map(async (uid) => {
+        const qs = new URLSearchParams();
+        qs.set('filter[uid]', uid);
+        qs.set('per_page', '1');
+
+        try {
+          const r = await fetch(`${BASE}/public-api/resources/id-tags/v2.0?${qs.toString()}`, { headers });
+          if (!r.ok) return;
+
+          const payload = await r.json();
+          const row = Array.isArray(payload?.data) ? payload.data[0] : null;
+          const uId = row?.userId ?? row?.user?.id ?? null;
+
+          if (uId != null) tagToUserId.set(uid, uId);
+        } catch {}
+      })
+    );
   }
+
   const extraUserIds = Array.from(tagToUserId.values()).filter(uId => !userMap.has(uId));
   for (let i = 0; i < extraUserIds.length; i += USER_CONCURRENCY) {
     await Promise.all(extraUserIds.slice(i, i + USER_CONCURRENCY).map(fetchUser));
@@ -196,82 +379,126 @@ module.exports = async (req, res) => {
        b) For any evseId still missing, call: /public-api/resources/charge-points/v1.0/{cpId}/evses
        c) If some are STILL missing, try global listing /public-api/resources/evses/v2.0
   =================================================== */
-  const wantedEvseIds = new Set(sessions.map(s => s.evseId).filter(v => v != null));
+  const wantedEvseIds = new Set(
+    sessions.map(s => s.evseId).filter(v => v != null)
+  );
 
   // (b) per-charge-point EVSE listing for missing
   const missingEvse = new Set([...wantedEvseIds].filter(id => !evseMap.has(id)));
   const CP_EVSE_CONCURRENCY = 6;
-  const cpIdsForEvse = Array.from(new Set(sessions.map(s => s.chargePointId).filter(v => v != null)));
+  const cpIdsForEvse = Array.from(
+    new Set(sessions.map(s => s.chargePointId).filter(v => v != null))
+  );
 
   for (let i = 0; i < cpIdsForEvse.length && missingEvse.size > 0; i += CP_EVSE_CONCURRENCY) {
     const chunk = cpIdsForEvse.slice(i, i + CP_EVSE_CONCURRENCY);
-    await Promise.all(chunk.map(async (cpId) => {
-      try {
-        let url = `${BASE}/public-api/resources/charge-points/v1.0/${cpId}/evses?per_page=100&cursor=`;
-        // page through per-CP evses
-        while (url && missingEvse.size > 0) {
-          const r = await fetch(url, { headers });
-          if (!r.ok) break;
-          const payload = await r.json();
-          const evses = Array.isArray(payload?.data) ? payload.data : [];
-          for (const e of evses) {
-            const id = e?.id ?? e?.evseId ?? null;
-            if (id != null) {
-              evseMap.set(id, e);
-              missingEvse.delete(id);
+
+    await Promise.all(
+      chunk.map(async (cpId) => {
+        try {
+          let url = `${BASE}/public-api/resources/charge-points/v1.0/${cpId}/evses?per_page=100&cursor=`;
+
+          // page through per-CP evses
+          while (url && missingEvse.size > 0) {
+            const r = await fetch(url, { headers });
+            if (!r.ok) break;
+
+            const payload = await r.json();
+            const evses = Array.isArray(payload?.data) ? payload.data : [];
+
+            for (const e of evses) {
+              const id = e?.id ?? e?.evseId ?? null;
+
+              if (id != null) {
+                evseMap.set(id, e);
+                missingEvse.delete(id);
+              }
             }
+
+            url = payload?.links?.next || null;
           }
-          url = payload?.links?.next || null;
-        }
-      } catch {}
-    }));
+        } catch {}
+      })
+    );
   }
 
   // (c) final fallback: global EVSE listing v2.x (NOT v1.0)
   if (missingEvse.size > 0) {
     let url = `${BASE}/public-api/resources/evses/v2.0?per_page=100&cursor=`;
     let tries = 0;
+
     while (url && tries < maxPages && missingEvse.size > 0) {
       const r = await fetch(url, { headers });
       if (!r.ok) break; // if forbidden or 404, just stop
+
       const payload = await r.json();
       const evses = Array.isArray(payload?.data) ? payload.data : [];
+
       for (const e of evses) {
         const id = e?.id ?? e?.evseId ?? null;
+
         if (id != null && missingEvse.has(id)) {
           evseMap.set(id, e);
           missingEvse.delete(id);
         }
       }
+
       url = payload?.links?.next || null;
       tries++;
     }
   }
 
   const extractEvseFields = (evse) => {
-    if (!evse || typeof evse !== 'object') return { evseType: null, connectorStandards: null, maxPowerKw: null };
+    if (!evse || typeof evse !== 'object') {
+      return {
+        evseType: null,
+        connectorStandards: null,
+        maxPowerKw: null,
+      };
+    }
+
     const evseType =
-      evse.type ?? evse.evseType ?? evse.currentType ?? evse.powerType ?? evse.dcAc ?? null;
+      evse.type ??
+      evse.evseType ??
+      evse.currentType ??
+      evse.powerType ??
+      evse.dcAc ??
+      null;
 
     const connectors = evse.connectors || evse.connectorList || [];
-    const connStandards = Array.from(new Set(
-      connectors.map(c => c?.standard || c?.type || c?.connectorType || c?.format || null).filter(Boolean)
-    ));
+
+    const connStandards = Array.from(
+      new Set(
+        connectors
+          .map(c => c?.standard || c?.type || c?.connectorType || c?.format || null)
+          .filter(Boolean)
+      )
+    );
+
     const connectorStandards = connStandards.length ? connStandards : null;
 
     let maxPowerKw = null;
     const pKw = evse.maxPowerKw ?? evse.powerKw ?? evse.power ?? null;
-    const pW  = evse.maxPowerW  ?? evse.powerW  ?? null;
-    if (Number.isFinite(Number(pKw))) maxPowerKw = Number(pKw);
-    else if (Number.isFinite(Number(pW))) maxPowerKw = Number(pW) / 1000;
+    const pW = evse.maxPowerW ?? evse.powerW ?? null;
 
-    return { evseType, connectorStandards, maxPowerKw: maxPowerKw ?? null };
+    if (Number.isFinite(Number(pKw))) {
+      maxPowerKw = Number(pKw);
+    } else if (Number.isFinite(Number(pW))) {
+      maxPowerKw = Number(pW) / 1000;
+    }
+
+    return {
+      evseType,
+      connectorStandards,
+      maxPowerKw: maxPowerKw ?? null,
+    };
   };
 
   /* ========== 6) Build response ========== */
   const enriched = sessions.map((s) => {
     const cp = cpMap.get(s.chargePointId);
     const { chargePointName, locationId } = extractCpFields(cp);
+
     const loc = locMap.get(locationId);
     const locFields = extractLocationFields(loc);
 
@@ -291,16 +518,26 @@ module.exports = async (req, res) => {
 
     return {
       ...s,
+
       chargePointName: chargePointName ?? null,
       locationId: locationId ?? null,
+
       holderName,
       holderEmail: userInfo?.email ?? null,
+
       evseType,
       connectorStandards,
       maxPowerKw,
+
       ...locFields,
+
+      // temporary debug field so we can inspect where AMPECO stores the city
+      rawLocation: loc ?? null,
     };
   });
 
-  return res.status(200).json({ count: enriched.length, data: enriched });
+  return res.status(200).json({
+    count: enriched.length,
+    data: enriched,
+  });
 };
